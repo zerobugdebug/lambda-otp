@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -17,6 +18,10 @@ import (
 	"github.com/aws/aws-sdk-go/service/sns"
 )
 
+const (
+	defaultEmailAddress = "notifications.otp@evacrane.com"
+)
+
 type OTPRequest struct {
 	Identifier string `json:"identifier"`
 	Method     string `json:"method"`
@@ -27,8 +32,17 @@ type OTPVerifyRequest struct {
 	OTP        string `json:"otp"`
 }
 
+func createResponse(statusCode int, body string) events.APIGatewayProxyResponse {
+	return events.APIGatewayProxyResponse{
+		StatusCode: statusCode,
+		Body:       body,
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+	}
+}
+
 func generateOTP() string {
-	rand.Seed(time.Now().UnixNano())
 	return fmt.Sprintf("%06d", rand.Intn(1000000))
 }
 
@@ -36,7 +50,7 @@ func sendOTP(request events.APIGatewayProxyRequest) (events.APIGatewayProxyRespo
 	var otpReq OTPRequest
 	err := json.Unmarshal([]byte(request.Body), &otpReq)
 	if err != nil {
-		return events.APIGatewayProxyResponse{StatusCode: 400, Body: "Invalid request body"}, nil
+		return createResponse(http.StatusBadRequest, "Invalid request body"), fmt.Errorf("failed to unmarshal request: %w", err)
 	}
 
 	otp := generateOTP()
@@ -54,7 +68,7 @@ func sendOTP(request events.APIGatewayProxyRequest) (events.APIGatewayProxyRespo
 		},
 	})
 	if err != nil {
-		return events.APIGatewayProxyResponse{StatusCode: 500, Body: "Failed to store OTP"}, err
+		return createResponse(http.StatusInternalServerError, "Failed to store OTP"), fmt.Errorf("failed to store OTP in DynamoDB: %w", err)
 	}
 
 	switch otpReq.Method {
@@ -67,7 +81,7 @@ func sendOTP(request events.APIGatewayProxyRequest) (events.APIGatewayProxyRespo
 	case "email":
 		sesClient := ses.New(sess)
 		_, err = sesClient.SendEmail(&ses.SendEmailInput{
-			Source: aws.String("your-verified-email@example.com"),
+			Source: aws.String(defaultEmailAddress),
 			Destination: &ses.Destination{
 				ToAddresses: []*string{aws.String(otpReq.Identifier)},
 			},
@@ -83,21 +97,21 @@ func sendOTP(request events.APIGatewayProxyRequest) (events.APIGatewayProxyRespo
 			},
 		})
 	default:
-		return events.APIGatewayProxyResponse{StatusCode: 400, Body: "Invalid method"}, nil
+		return createResponse(http.StatusBadRequest, "Invalid method"), fmt.Errorf("invalid OTP send method: %s", otpReq.Method)
 	}
 
 	if err != nil {
-		return events.APIGatewayProxyResponse{StatusCode: 500, Body: "Failed to send OTP"}, err
+		return createResponse(http.StatusInternalServerError, "Failed to send OTP"), fmt.Errorf("failed to send OTP: %w", err)
 	}
 
-	return events.APIGatewayProxyResponse{StatusCode: 200, Body: "OTP sent successfully"}, nil
+	return createResponse(http.StatusOK, "OTP sent successfully"), nil
 }
 
 func verifyOTP(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
 	var verifyReq OTPVerifyRequest
 	err := json.Unmarshal([]byte(request.Body), &verifyReq)
 	if err != nil {
-		return events.APIGatewayProxyResponse{StatusCode: 400, Body: "Invalid request body"}, nil
+		return createResponse(http.StatusBadRequest, "Invalid request body"), fmt.Errorf("failed to unmarshal request: %w", err)
 	}
 
 	sess := session.Must(session.NewSession())
@@ -114,25 +128,25 @@ func verifyOTP(request events.APIGatewayProxyRequest) (events.APIGatewayProxyRes
 	})
 
 	if err != nil {
-		return events.APIGatewayProxyResponse{StatusCode: 500, Body: "Failed to retrieve OTP"}, err
+		return createResponse(http.StatusInternalServerError, "Failed to retrieve OTP"), fmt.Errorf("failed to query DynamoDB: %w", err)
 	}
 
 	if len(result.Items) == 0 {
-		return events.APIGatewayProxyResponse{StatusCode: 400, Body: "No OTP found"}, nil
+		return createResponse(http.StatusBadRequest, "No OTP found"), fmt.Errorf("no OTP found for identifier: %s", verifyReq.Identifier)
 	}
 
 	storedOTP := *result.Items[0]["OTP"].S
 	createdAt, _ := strconv.ParseInt(*result.Items[0]["CreatedAt"].N, 10, 64)
 
 	if time.Now().Unix()-createdAt > 300 { // OTP expires after 5 minutes
-		return events.APIGatewayProxyResponse{StatusCode: 400, Body: "OTP expired"}, nil
+		return createResponse(http.StatusBadRequest, "OTP expired"), fmt.Errorf("OTP expired for identifier: %s", verifyReq.Identifier)
 	}
 
 	if verifyReq.OTP != storedOTP {
-		return events.APIGatewayProxyResponse{StatusCode: 400, Body: "Invalid OTP"}, nil
+		return createResponse(http.StatusBadRequest, "Invalid OTP"), fmt.Errorf("invalid OTP provided for identifier: %s", verifyReq.Identifier)
 	}
 
-	return events.APIGatewayProxyResponse{StatusCode: 200, Body: "OTP verified successfully"}, nil
+	return createResponse(http.StatusOK, "OTP verified successfully"), nil
 }
 
 func main() {
@@ -146,6 +160,6 @@ func handleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (
 	case "/verify-otp":
 		return verifyOTP(request)
 	default:
-		return events.APIGatewayProxyResponse{StatusCode: 404, Body: "Not Found"}, nil
+		return createResponse(http.StatusNotFound, "Not Found"), fmt.Errorf("unknown resource: %s", request.Resource)
 	}
 }
